@@ -409,6 +409,7 @@ class AccountService:
             raise PasswordResetRateLimitExceededError()
 
         code = "".join([str(random.randint(0, 9)) for _ in range(6)])
+        logging.info(f"send_reset_password_email: {account_email}, {code}")
         token = TokenManager.generate_token(
             account=account, email=email, token_type="reset_password", additional_data={"code": code}
         )
@@ -609,8 +610,32 @@ class TenantService:
         if available_ta:
             return
 
-        """Create owner tenant if not exist"""
-        if not FeatureService.get_system_features().is_allow_create_workspace and not is_setup:
+        """Create owner tenant if not exist (extended: prefer auto join admin workspace)"""
+        system_features = FeatureService.get_system_features()
+
+        # -------------- Extend Begin - 自动加入管理员工作空间（优先） --------------
+        logging.info(f"system_features.auto_join_admin_workspace: {system_features.auto_join_admin_workspace}")
+        if system_features.auto_join_admin_workspace:
+            from services.account_service_extend import TenantExtendService
+
+            # 获取系统中最早创建的工作空间作为管理员工作空间
+            admin_tenant = TenantExtendService.get_super_admin_tenant_id()
+
+            if admin_tenant:
+                logging.info(f'get_super_admin_tenant_id is found:{admin_tenant.id}')
+                # 若不存在成员关系则创建，并将其设置为当前工作空间
+                TenantExtendService.create_default_tenant_member_if_not_exist(
+                    admin_tenant.id, account.id, role="normal"
+                )
+                TenantService.switch_tenant(account, admin_tenant.id)
+                account.current_tenant = admin_tenant
+                return
+            else :
+                logging.info(f'get_super_admin_tenant_id is none')
+        # -------------- Extend End - 自动加入管理员工作空间（优先） --------------
+
+        # 兜底：按原逻辑创建个人工作空间（当允许创建或是安装初始化阶段）
+        if not system_features.is_allow_create_workspace and not is_setup:
             raise WorkSpaceNotAllowedCreateError()
 
         if name:

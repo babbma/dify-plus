@@ -840,6 +840,10 @@ class LoginConfig(BaseSettings):
         description="whether to enable create workspace",
         default=False,
     )
+    AUTO_JOIN_ADMIN_WORKSPACE: bool = Field(
+        description="whether to auto join admin workspace when register",
+        default=False,
+    )
 
 
 class AccountConfig(BaseSettings):
