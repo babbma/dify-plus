@@ -184,9 +184,10 @@ class SystemFeatureModel(BaseModel):
     enable_explore_banner: bool = False
     is_custom_auth2: str = ""  # extend: Customizing AUTH2
     is_custom_auth2_logout: str = ""  # extend: Customizing AUTH2
-    ding_talk_client_id: str = ""  # extend: DingTalk third-party login
-    ding_talk_corp_id: str = ""  # extend: DingTalk sidebar login
-    ding_talk: bool = ""  # extend: DingTalk sidebar login
+    ding_talk_client_id: str = "" # extend: DingTalk third-party login
+    ding_talk_corp_id: str = "" # extend: DingTalk sidebar login
+    ding_talk: bool = "" # extend: DingTalk sidebar login
+    auto_join_admin_workspace: bool = False
 
 
 class FeatureService:
@@ -249,6 +250,7 @@ class FeatureService:
     @classmethod
     def _fulfill_system_params_from_env(cls, system_features: SystemFeatureModel):
         system_features.enable_email_code_login = dify_config.ENABLE_EMAIL_CODE_LOGIN
+        system_features.auto_join_admin_workspace = dify_config.AUTO_JOIN_ADMIN_WORKSPACE
         system_features.enable_email_password_login = dify_config.ENABLE_EMAIL_PASSWORD_LOGIN
         system_features.enable_social_oauth_login = dify_config.ENABLE_SOCIAL_OAUTH_LOGIN
         system_features.is_allow_register = dify_config.ALLOW_REGISTER
