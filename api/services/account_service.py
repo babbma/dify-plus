@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import random
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -16,8 +17,7 @@ from configs import dify_config
 from constants.languages import language_timezone_mapping, languages
 from events.tenant_event import tenant_was_created
 from extensions.ext_database import db
-from extensions.ext_redis import redis_client, redis_fallback
-from libs.datetime_utils import naive_utc_now
+from extensions.ext_redis import redis_client
 from libs.helper import RateLimiter, TokenManager
 from libs.passport import PassportService
 from libs.password import compare_password, hash_password, valid_password
@@ -29,7 +29,6 @@ from models.account import (
     Tenant,
     TenantAccountJoin,
     TenantAccountRole,
-    TenantPluginAutoUpgradeStrategy,
     TenantStatus,
 )
 from models.account_money_extend import AccountMoneyExtend
@@ -51,24 +50,13 @@ from services.errors.account import (
     RoleAlreadyAssignedError,
     TenantNotFoundError,
 )
-from services.errors.workspace import WorkSpaceNotAllowedCreateError, WorkspacesLimitExceededError
+from services.errors.workspace import WorkSpaceNotAllowedCreateError
 from services.feature_service import FeatureService
 from tasks.delete_account_task import delete_account_task
 from tasks.mail_account_deletion_task import send_account_deletion_verification_code
-from tasks.mail_change_mail_task import (
-    send_change_mail_completed_notification_task,
-    send_change_mail_task,
-)
 from tasks.mail_email_code_login import send_email_code_login_mail_task
 from tasks.mail_invite_member_task import send_invite_member_mail_task
-from tasks.mail_owner_transfer_task import (
-    send_new_owner_transfer_notify_email_task,
-    send_old_owner_transfer_notify_email_task,
-    send_owner_transfer_confirm_task,
-)
 from tasks.mail_reset_password_task import send_reset_password_mail_task
-
-logger = logging.getLogger(__name__)
 
 
 class TokenPair(BaseModel):
@@ -89,13 +77,8 @@ class AccountService:
     email_code_account_deletion_rate_limiter = RateLimiter(
         prefix="email_code_account_deletion_rate_limit", max_attempts=1, time_window=60 * 1
     )
-    change_email_rate_limiter = RateLimiter(prefix="change_email_rate_limit", max_attempts=1, time_window=60 * 1)
-    owner_transfer_rate_limiter = RateLimiter(prefix="owner_transfer_rate_limit", max_attempts=1, time_window=60 * 1)
-
     LOGIN_MAX_ERROR_LIMITS = 5
     FORGOT_PASSWORD_MAX_ERROR_LIMITS = 5
-    CHANGE_EMAIL_MAX_ERROR_LIMITS = 5
-    OWNER_TRANSFER_MAX_ERROR_LIMITS = 5
 
     @staticmethod
     def _get_refresh_token_key(refresh_token: str) -> str:
@@ -126,31 +109,25 @@ class AccountService:
         if account.status == AccountStatus.BANNED.value:
             raise Unauthorized("Account is banned.")
 
-        current_tenant = db.session.query(TenantAccountJoin).filter_by(account_id=account.id, current=True).first()
+        current_tenant = TenantAccountJoin.query.filter_by(account_id=account.id, current=True).first()
         if current_tenant:
-            account.set_tenant_id(current_tenant.tenant_id)
+            account.current_tenant_id = current_tenant.tenant_id
         else:
             available_ta = (
-                db.session.query(TenantAccountJoin)
-                .filter_by(account_id=account.id)
-                .order_by(TenantAccountJoin.id.asc())
-                .first()
+                TenantAccountJoin.query.filter_by(account_id=account.id).order_by(TenantAccountJoin.id.asc()).first()
             )
             if not available_ta:
                 return None
 
-            account.set_tenant_id(available_ta.tenant_id)
+            account.current_tenant_id = available_ta.tenant_id
             available_ta.current = True
             db.session.commit()
 
-        if naive_utc_now() - account.last_active_at > timedelta(minutes=10):
-            account.last_active_at = naive_utc_now()
+        if datetime.now(UTC).replace(tzinfo=None) - account.last_active_at > timedelta(minutes=10):
+            account.last_active_at = datetime.now(UTC).replace(tzinfo=None)
             db.session.commit()
-        # NOTE: make sure account is accessible outside of a db session
-        # This ensures that it will work correctly after upgrading to Flask version 3.1.2
-        db.session.refresh(account)
-        db.session.close()
-        return account
+
+        return cast(Account, account)
 
     @staticmethod
     def get_account_jwt_token(account: Account) -> str:
@@ -191,11 +168,11 @@ class AccountService:
 
         if account.status == AccountStatus.PENDING.value:
             account.status = AccountStatus.ACTIVE.value
-            account.initialized_at = naive_utc_now()
+            account.initialized_at = datetime.now(UTC).replace(tzinfo=None)
 
         db.session.commit()
 
-        return account
+        return cast(Account, account)
 
     @staticmethod
     def update_account_password(account, password, new_password):
@@ -282,7 +259,7 @@ class AccountService:
 
     @staticmethod
     def generate_account_deletion_verification_code(account: Account) -> tuple[str, str]:
-        code = "".join([str(secrets.randbelow(exclusive_upper_bound=10)) for _ in range(6)])
+        code = "".join([str(random.randint(0, 9)) for _ in range(6)])
         token = TokenManager.generate_token(
             account=account, token_type="account_deletion", additional_data={"code": code}
         )
@@ -321,15 +298,15 @@ class AccountService:
         """Link account integrate"""
         try:
             # Query whether there is an existing binding record for the same provider
-            account_integrate: Optional[AccountIntegrate] = (
-                db.session.query(AccountIntegrate).filter_by(account_id=account.id, provider=provider).first()
-            )
+            account_integrate: Optional[AccountIntegrate] = AccountIntegrate.query.filter_by(
+                account_id=account.id, provider=provider
+            ).first()
 
             if account_integrate:
                 # If it exists, update the record
                 account_integrate.open_id = open_id
                 account_integrate.encrypted_token = ""  # todo
-                account_integrate.updated_at = naive_utc_now()
+                account_integrate.updated_at = datetime.now(UTC).replace(tzinfo=None)
             else:
                 # If it does not exist, create a new record
                 account_integrate = AccountIntegrate(
@@ -338,9 +315,9 @@ class AccountService:
                 db.session.add(account_integrate)
 
             db.session.commit()
-            logger.info("Account %s linked %s account %s.", account.id, provider, open_id)
+            logging.info(f"Account {account.id} linked {provider} account {open_id}.")
         except Exception as e:
-            logger.exception("Failed to link %s account %s to Account %s", provider, open_id, account.id)
+            logging.exception(f"Failed to link {provider} account {open_id} to Account {account.id}")
             raise LinkAccountIntegrateError("Failed to link account.") from e
 
     @staticmethod
@@ -362,20 +339,9 @@ class AccountService:
         return account
 
     @staticmethod
-    def update_account_email(account: Account, email: str) -> Account:
-        """Update account email"""
-        account.email = email
-        account_integrate = db.session.query(AccountIntegrate).filter_by(account_id=account.id).first()
-        if account_integrate:
-            db.session.delete(account_integrate)
-        db.session.add(account)
-        db.session.commit()
-        return account
-
-    @staticmethod
     def update_login_info(account: Account, *, ip_address: str) -> None:
         """Update last login time and ip"""
-        account.last_login_at = naive_utc_now()
+        account.last_login_at = datetime.now(UTC).replace(tzinfo=None)
         account.last_login_ip = ip_address
         db.session.add(account)
         db.session.commit()
@@ -431,7 +397,7 @@ class AccountService:
         cls,
         account: Optional[Account] = None,
         email: Optional[str] = None,
-        language: str = "en-US",
+        language: Optional[str] = "en-US",
     ):
         account_email = account.email if account else email
         if account_email is None:
@@ -442,8 +408,11 @@ class AccountService:
 
             raise PasswordResetRateLimitExceededError()
 
-        code, token = cls.generate_reset_password_token(account_email, account)
-
+        code = "".join([str(random.randint(0, 9)) for _ in range(6)])
+        logging.info(f"send_reset_password_email: {account_email}, {code}")
+        token = TokenManager.generate_token(
+            account=account, email=email, token_type="reset_password", additional_data={"code": code}
+        )
         send_reset_password_mail_task.delay(
             language=language,
             to=account_email,
@@ -453,201 +422,16 @@ class AccountService:
         return token
 
     @classmethod
-    def send_change_email_email(
-        cls,
-        account: Optional[Account] = None,
-        email: Optional[str] = None,
-        old_email: Optional[str] = None,
-        language: str = "en-US",
-        phase: Optional[str] = None,
-    ):
-        account_email = account.email if account else email
-        if account_email is None:
-            raise ValueError("Email must be provided.")
-        if not phase:
-            raise ValueError("phase must be provided.")
-
-        if cls.change_email_rate_limiter.is_rate_limited(account_email):
-            from controllers.console.auth.error import EmailChangeRateLimitExceededError
-
-            raise EmailChangeRateLimitExceededError()
-
-        code, token = cls.generate_change_email_token(account_email, account, old_email=old_email)
-
-        send_change_mail_task.delay(
-            language=language,
-            to=account_email,
-            code=code,
-            phase=phase,
-        )
-        cls.change_email_rate_limiter.increment_rate_limit(account_email)
-        return token
-
-    @classmethod
-    def send_change_email_completed_notify_email(
-        cls,
-        account: Optional[Account] = None,
-        email: Optional[str] = None,
-        language: str = "en-US",
-    ):
-        account_email = account.email if account else email
-        if account_email is None:
-            raise ValueError("Email must be provided.")
-
-        send_change_mail_completed_notification_task.delay(
-            language=language,
-            to=account_email,
-        )
-
-    @classmethod
-    def send_owner_transfer_email(
-        cls,
-        account: Optional[Account] = None,
-        email: Optional[str] = None,
-        language: str = "en-US",
-        workspace_name: Optional[str] = "",
-    ):
-        account_email = account.email if account else email
-        if account_email is None:
-            raise ValueError("Email must be provided.")
-
-        if cls.owner_transfer_rate_limiter.is_rate_limited(account_email):
-            from controllers.console.auth.error import OwnerTransferRateLimitExceededError
-
-            raise OwnerTransferRateLimitExceededError()
-
-        code, token = cls.generate_owner_transfer_token(account_email, account)
-        workspace_name = workspace_name or ""
-
-        send_owner_transfer_confirm_task.delay(
-            language=language,
-            to=account_email,
-            code=code,
-            workspace=workspace_name,
-        )
-        cls.owner_transfer_rate_limiter.increment_rate_limit(account_email)
-        return token
-
-    @classmethod
-    def send_old_owner_transfer_notify_email(
-        cls,
-        account: Optional[Account] = None,
-        email: Optional[str] = None,
-        language: str = "en-US",
-        workspace_name: Optional[str] = "",
-        new_owner_email: str = "",
-    ):
-        account_email = account.email if account else email
-        if account_email is None:
-            raise ValueError("Email must be provided.")
-        workspace_name = workspace_name or ""
-
-        send_old_owner_transfer_notify_email_task.delay(
-            language=language,
-            to=account_email,
-            workspace=workspace_name,
-            new_owner_email=new_owner_email,
-        )
-
-    @classmethod
-    def send_new_owner_transfer_notify_email(
-        cls,
-        account: Optional[Account] = None,
-        email: Optional[str] = None,
-        language: str = "en-US",
-        workspace_name: Optional[str] = "",
-    ):
-        account_email = account.email if account else email
-        if account_email is None:
-            raise ValueError("Email must be provided.")
-        workspace_name = workspace_name or ""
-
-        send_new_owner_transfer_notify_email_task.delay(
-            language=language,
-            to=account_email,
-            workspace=workspace_name,
-        )
-
-    @classmethod
-    def generate_reset_password_token(
-        cls,
-        email: str,
-        account: Optional[Account] = None,
-        code: Optional[str] = None,
-        additional_data: dict[str, Any] = {},
-    ):
-        if not code:
-            code = "".join([str(secrets.randbelow(exclusive_upper_bound=10)) for _ in range(6)])
-        additional_data["code"] = code
-        token = TokenManager.generate_token(
-            account=account, email=email, token_type="reset_password", additional_data=additional_data
-        )
-        return code, token
-
-    @classmethod
-    def generate_change_email_token(
-        cls,
-        email: str,
-        account: Optional[Account] = None,
-        code: Optional[str] = None,
-        old_email: Optional[str] = None,
-        additional_data: dict[str, Any] = {},
-    ):
-        if not code:
-            code = "".join([str(secrets.randbelow(exclusive_upper_bound=10)) for _ in range(6)])
-        additional_data["code"] = code
-        additional_data["old_email"] = old_email
-        token = TokenManager.generate_token(
-            account=account, email=email, token_type="change_email", additional_data=additional_data
-        )
-        return code, token
-
-    @classmethod
-    def generate_owner_transfer_token(
-        cls,
-        email: str,
-        account: Optional[Account] = None,
-        code: Optional[str] = None,
-        additional_data: dict[str, Any] = {},
-    ):
-        if not code:
-            code = "".join([str(secrets.randbelow(exclusive_upper_bound=10)) for _ in range(6)])
-        additional_data["code"] = code
-        token = TokenManager.generate_token(
-            account=account, email=email, token_type="owner_transfer", additional_data=additional_data
-        )
-        return code, token
-
-    @classmethod
     def revoke_reset_password_token(cls, token: str):
         TokenManager.revoke_token(token, "reset_password")
-
-    @classmethod
-    def revoke_change_email_token(cls, token: str):
-        TokenManager.revoke_token(token, "change_email")
-
-    @classmethod
-    def revoke_owner_transfer_token(cls, token: str):
-        TokenManager.revoke_token(token, "owner_transfer")
 
     @classmethod
     def get_reset_password_data(cls, token: str) -> Optional[dict[str, Any]]:
         return TokenManager.get_token_data(token, "reset_password")
 
     @classmethod
-    def get_change_email_data(cls, token: str) -> Optional[dict[str, Any]]:
-        return TokenManager.get_token_data(token, "change_email")
-
-    @classmethod
-    def get_owner_transfer_data(cls, token: str) -> Optional[dict[str, Any]]:
-        return TokenManager.get_token_data(token, "owner_transfer")
-
-    @classmethod
     def send_email_code_login_email(
-        cls,
-        account: Optional[Account] = None,
-        email: Optional[str] = None,
-        language: str = "en-US",
+        cls, account: Optional[Account] = None, email: Optional[str] = None, language: Optional[str] = "en-US"
     ):
         email = account.email if account else email
         if email is None:
@@ -657,7 +441,7 @@ class AccountService:
 
             raise EmailCodeLoginRateLimitExceededError()
 
-        code = "".join([str(secrets.randbelow(exclusive_upper_bound=10)) for _ in range(6)])
+        code = "".join([str(random.randint(0, 9)) for _ in range(6)])
         token = TokenManager.generate_token(
             account=account, email=email, token_type="email_code_login", additional_data={"code": code}
         )
@@ -687,7 +471,7 @@ class AccountService:
                 )
             )
 
-        account = db.session.query(Account).where(Account.email == email).first()
+        account = db.session.query(Account).filter(Account.email == email).first()
         if not account:
             return None
 
@@ -696,14 +480,7 @@ class AccountService:
 
         return account
 
-    @classmethod
-    def is_account_in_freeze(cls, email: str) -> bool:
-        if dify_config.BILLING_ENABLED and BillingService.is_email_in_freeze(email):
-            return True
-        return False
-
     @staticmethod
-    @redis_fallback(default_return=None)
     def add_login_error_rate_limit(email: str) -> None:
         key = f"login_error_rate_limit:{email}"
         count = redis_client.get(key)
@@ -713,7 +490,6 @@ class AccountService:
         redis_client.setex(key, dify_config.LOGIN_LOCKOUT_DURATION, count)
 
     @staticmethod
-    @redis_fallback(default_return=False)
     def is_login_error_rate_limit(email: str) -> bool:
         key = f"login_error_rate_limit:{email}"
         count = redis_client.get(key)
@@ -726,13 +502,11 @@ class AccountService:
         return False
 
     @staticmethod
-    @redis_fallback(default_return=None)
     def reset_login_error_rate_limit(email: str):
         key = f"login_error_rate_limit:{email}"
         redis_client.delete(key)
 
     @staticmethod
-    @redis_fallback(default_return=None)
     def add_forgot_password_error_rate_limit(email: str) -> None:
         key = f"forgot_password_error_rate_limit:{email}"
         count = redis_client.get(key)
@@ -742,7 +516,6 @@ class AccountService:
         redis_client.setex(key, dify_config.FORGOT_PASSWORD_LOCKOUT_DURATION, count)
 
     @staticmethod
-    @redis_fallback(default_return=False)
     def is_forgot_password_error_rate_limit(email: str) -> bool:
         key = f"forgot_password_error_rate_limit:{email}"
         count = redis_client.get(key)
@@ -755,69 +528,11 @@ class AccountService:
         return False
 
     @staticmethod
-    @redis_fallback(default_return=None)
     def reset_forgot_password_error_rate_limit(email: str):
         key = f"forgot_password_error_rate_limit:{email}"
         redis_client.delete(key)
 
     @staticmethod
-    @redis_fallback(default_return=None)
-    def add_change_email_error_rate_limit(email: str) -> None:
-        key = f"change_email_error_rate_limit:{email}"
-        count = redis_client.get(key)
-        if count is None:
-            count = 0
-        count = int(count) + 1
-        redis_client.setex(key, dify_config.CHANGE_EMAIL_LOCKOUT_DURATION, count)
-
-    @staticmethod
-    @redis_fallback(default_return=False)
-    def is_change_email_error_rate_limit(email: str) -> bool:
-        key = f"change_email_error_rate_limit:{email}"
-        count = redis_client.get(key)
-        if count is None:
-            return False
-        count = int(count)
-        if count > AccountService.CHANGE_EMAIL_MAX_ERROR_LIMITS:
-            return True
-        return False
-
-    @staticmethod
-    @redis_fallback(default_return=None)
-    def reset_change_email_error_rate_limit(email: str):
-        key = f"change_email_error_rate_limit:{email}"
-        redis_client.delete(key)
-
-    @staticmethod
-    @redis_fallback(default_return=None)
-    def add_owner_transfer_error_rate_limit(email: str) -> None:
-        key = f"owner_transfer_error_rate_limit:{email}"
-        count = redis_client.get(key)
-        if count is None:
-            count = 0
-        count = int(count) + 1
-        redis_client.setex(key, dify_config.OWNER_TRANSFER_LOCKOUT_DURATION, count)
-
-    @staticmethod
-    @redis_fallback(default_return=False)
-    def is_owner_transfer_error_rate_limit(email: str) -> bool:
-        key = f"owner_transfer_error_rate_limit:{email}"
-        count = redis_client.get(key)
-        if count is None:
-            return False
-        count = int(count)
-        if count > AccountService.OWNER_TRANSFER_MAX_ERROR_LIMITS:
-            return True
-        return False
-
-    @staticmethod
-    @redis_fallback(default_return=None)
-    def reset_owner_transfer_error_rate_limit(email: str):
-        key = f"owner_transfer_error_rate_limit:{email}"
-        redis_client.delete(key)
-
-    @staticmethod
-    @redis_fallback(default_return=False)
     def is_email_send_ip_limit(ip_address: str):
         minute_key = f"email_send_ip_limit_minute:{ip_address}"
         freeze_key = f"email_send_ip_limit_freeze:{ip_address}"
@@ -857,9 +572,9 @@ class AccountService:
 
         return False
 
-    @staticmethod
-    def check_email_unique(email: str) -> bool:
-        return db.session.query(Account).filter_by(email=email).first() is None
+
+def _get_login_cache_key(*, account_id: str, token: str):
+    return f"account_login:{account_id}:{token}"
 
 
 class TenantService:
@@ -879,17 +594,6 @@ class TenantService:
         db.session.add(tenant)
         db.session.commit()
 
-        plugin_upgrade_strategy = TenantPluginAutoUpgradeStrategy(
-            tenant_id=tenant.id,
-            strategy_setting=TenantPluginAutoUpgradeStrategy.StrategySetting.FIX_ONLY,
-            upgrade_time_of_day=0,
-            upgrade_mode=TenantPluginAutoUpgradeStrategy.UpgradeMode.EXCLUDE,
-            exclude_plugins=[],
-            include_plugins=[],
-        )
-        db.session.add(plugin_upgrade_strategy)
-        db.session.commit()
-
         tenant.encrypt_public_key = generate_key_pair(tenant.id)
         db.session.commit()
         return tenant
@@ -900,22 +604,39 @@ class TenantService:
     ):
         """Check if user have a workspace or not"""
         available_ta = (
-            db.session.query(TenantAccountJoin)
-            .filter_by(account_id=account.id)
-            .order_by(TenantAccountJoin.id.asc())
-            .first()
+            TenantAccountJoin.query.filter_by(account_id=account.id).order_by(TenantAccountJoin.id.asc()).first()
         )
 
         if available_ta:
             return
 
-        """Create owner tenant if not exist"""
-        if not FeatureService.get_system_features().is_allow_create_workspace and not is_setup:
-            raise WorkSpaceNotAllowedCreateError()
+        """Create owner tenant if not exist (extended: prefer auto join admin workspace)"""
+        system_features = FeatureService.get_system_features()
 
-        workspaces = FeatureService.get_system_features().license.workspaces
-        if not workspaces.is_available():
-            raise WorkspacesLimitExceededError()
+        # -------------- Extend Begin - 自动加入管理员工作空间（优先） --------------
+        logging.info(f"system_features.auto_join_admin_workspace: {system_features.auto_join_admin_workspace}")
+        if system_features.auto_join_admin_workspace:
+            from services.account_service_extend import TenantExtendService
+
+            # 获取系统中最早创建的工作空间作为管理员工作空间
+            admin_tenant = TenantExtendService.get_super_admin_tenant_id()
+
+            if admin_tenant:
+                logging.info(f'get_super_admin_tenant_id is found:{admin_tenant.id}')
+                # 若不存在成员关系则创建，并将其设置为当前工作空间
+                TenantExtendService.create_default_tenant_member_if_not_exist(
+                    admin_tenant.id, account.id, role="normal"
+                )
+                TenantService.switch_tenant(account, admin_tenant.id)
+                account.current_tenant = admin_tenant
+                return
+            else :
+                logging.info(f'get_super_admin_tenant_id is none')
+        # -------------- Extend End - 自动加入管理员工作空间（优先） --------------
+
+        # 兜底：按原逻辑创建个人工作空间（当允许创建或是安装初始化阶段）
+        if not system_features.is_allow_create_workspace and not is_setup:
+            raise WorkSpaceNotAllowedCreateError()
 
         if name:
             tenant = TenantService.create_tenant(name=name, is_setup=is_setup)
@@ -931,7 +652,7 @@ class TenantService:
         """Create tenant member"""
         if role == TenantAccountRole.OWNER.value:
             if TenantService.has_roles(tenant, [TenantAccountRole.OWNER]):
-                logger.error("Tenant %s has already an owner.", tenant.id)
+                logging.error(f"Tenant {tenant.id} has already an owner.")
                 raise Exception("Tenant already has an owner.")
 
         ta = db.session.query(TenantAccountJoin).filter_by(tenant_id=tenant.id, account_id=account.id).first()
@@ -950,7 +671,7 @@ class TenantService:
         return (
             db.session.query(Tenant)
             .join(TenantAccountJoin, Tenant.id == TenantAccountJoin.tenant_id)
-            .where(TenantAccountJoin.account_id == account.id, Tenant.status == TenantStatus.NORMAL)
+            .filter(TenantAccountJoin.account_id == account.id, Tenant.status == TenantStatus.NORMAL)
             .all()
         )
 
@@ -961,7 +682,7 @@ class TenantService:
         if not tenant:
             raise TenantNotFoundError("Tenant not found.")
 
-        ta = db.session.query(TenantAccountJoin).filter_by(tenant_id=tenant.id, account_id=account.id).first()
+        ta = TenantAccountJoin.query.filter_by(tenant_id=tenant.id, account_id=account.id).first()
         if ta:
             tenant.role = ta.role
         else:
@@ -979,7 +700,7 @@ class TenantService:
         tenant_account_join = (
             db.session.query(TenantAccountJoin)
             .join(Tenant, TenantAccountJoin.tenant_id == Tenant.id)
-            .where(
+            .filter(
                 TenantAccountJoin.account_id == account.id,
                 TenantAccountJoin.tenant_id == tenant_id,
                 Tenant.status == TenantStatus.NORMAL,
@@ -990,12 +711,12 @@ class TenantService:
         if not tenant_account_join:
             raise AccountNotLinkTenantError("Tenant not found or account is not a member of the tenant.")
         else:
-            db.session.query(TenantAccountJoin).where(
+            TenantAccountJoin.query.filter(
                 TenantAccountJoin.account_id == account.id, TenantAccountJoin.tenant_id != tenant_id
             ).update({"current": False})
             tenant_account_join.current = True
             # Set the current tenant for the account
-            account.set_tenant_id(tenant_account_join.tenant_id)
+            account.current_tenant_id = tenant_account_join.tenant_id
             db.session.commit()
 
     @staticmethod
@@ -1005,7 +726,7 @@ class TenantService:
             db.session.query(Account, TenantAccountJoin.role)
             .select_from(Account)
             .join(TenantAccountJoin, Account.id == TenantAccountJoin.account_id)
-            .where(TenantAccountJoin.tenant_id == tenant.id)
+            .filter(TenantAccountJoin.tenant_id == tenant.id)
         )
 
         # Initialize an empty list to store the updated accounts
@@ -1024,8 +745,8 @@ class TenantService:
             db.session.query(Account, TenantAccountJoin.role)
             .select_from(Account)
             .join(TenantAccountJoin, Account.id == TenantAccountJoin.account_id)
-            .where(TenantAccountJoin.tenant_id == tenant.id)
-            .where(TenantAccountJoin.role == "dataset_operator")
+            .filter(TenantAccountJoin.tenant_id == tenant.id)
+            .filter(TenantAccountJoin.role == "dataset_operator")
         )
 
         # Initialize an empty list to store the updated accounts
@@ -1045,7 +766,9 @@ class TenantService:
 
         return (
             db.session.query(TenantAccountJoin)
-            .where(TenantAccountJoin.tenant_id == tenant.id, TenantAccountJoin.role.in_([role.value for role in roles]))
+            .filter(
+                TenantAccountJoin.tenant_id == tenant.id, TenantAccountJoin.role.in_([role.value for role in roles])
+            )
             .first()
             is not None
         )
@@ -1055,10 +778,10 @@ class TenantService:
         """Get the role of the current account for a given tenant"""
         join = (
             db.session.query(TenantAccountJoin)
-            .where(TenantAccountJoin.tenant_id == tenant.id, TenantAccountJoin.account_id == account.id)
+            .filter(TenantAccountJoin.tenant_id == tenant.id, TenantAccountJoin.account_id == account.id)
             .first()
         )
-        return TenantAccountRole(join.role) if join else None
+        return join.role if join else None
 
     @staticmethod
     def get_tenant_count() -> int:
@@ -1080,7 +803,7 @@ class TenantService:
             if operator.id == member.id:
                 raise CannotOperateSelfError("Cannot operate self.")
 
-        ta_operator = db.session.query(TenantAccountJoin).filter_by(tenant_id=tenant.id, account_id=operator.id).first()
+        ta_operator = TenantAccountJoin.query.filter_by(tenant_id=tenant.id, account_id=operator.id).first()
 
         if not ta_operator or ta_operator.role not in perms[action]:
             raise NoPermissionError(f"No permission to {action} member.")
@@ -1093,7 +816,7 @@ class TenantService:
 
         TenantService.check_member_permission(tenant, operator, account, "remove")
 
-        ta = db.session.query(TenantAccountJoin).filter_by(tenant_id=tenant.id, account_id=account.id).first()
+        ta = TenantAccountJoin.query.filter_by(tenant_id=tenant.id, account_id=account.id).first()
         if not ta:
             raise MemberNotInTenantError("Member not in tenant.")
 
@@ -1105,42 +828,34 @@ class TenantService:
         """Update member role"""
         TenantService.check_member_permission(tenant, operator, member, "update")
 
-        target_member_join = (
-            db.session.query(TenantAccountJoin).filter_by(tenant_id=tenant.id, account_id=member.id).first()
-        )
-
-        if not target_member_join:
-            raise MemberNotInTenantError("Member not in tenant.")
+        target_member_join = TenantAccountJoin.query.filter_by(tenant_id=tenant.id, account_id=member.id).first()
 
         if target_member_join.role == new_role:
             raise RoleAlreadyAssignedError("The provided role is already assigned to the member.")
 
         if new_role == "owner":
             # Find the current owner and change their role to 'admin'
-            current_owner_join = (
-                db.session.query(TenantAccountJoin).filter_by(tenant_id=tenant.id, role="owner").first()
-            )
-            if current_owner_join:
-                current_owner_join.role = "admin"
+            current_owner_join = TenantAccountJoin.query.filter_by(tenant_id=tenant.id, role="owner").first()
+            current_owner_join.role = "admin"
 
         # Update the role of the target member
         target_member_join.role = new_role
         db.session.commit()
 
     @staticmethod
+    def dissolve_tenant(tenant: Tenant, operator: Account) -> None:
+        """Dissolve tenant"""
+        if not TenantService.check_member_permission(tenant, operator, operator, "remove"):
+            raise NoPermissionError("No permission to dissolve tenant.")
+        db.session.query(TenantAccountJoin).filter_by(tenant_id=tenant.id).delete()
+        db.session.delete(tenant)
+        db.session.commit()
+
+    @staticmethod
     def get_custom_config(tenant_id: str) -> dict:
-        tenant = db.get_or_404(Tenant, tenant_id)
+        tenant = Tenant.query.filter(Tenant.id == tenant_id).one_or_404()
 
-        return tenant.custom_config_dict
-
-    @staticmethod
-    def is_owner(account: Account, tenant: Tenant) -> bool:
-        return TenantService.get_user_role(account, tenant) == TenantAccountRole.OWNER
-
-    @staticmethod
-    def is_member(account: Account, tenant: Tenant) -> bool:
-        """Check if the account is a member of the tenant"""
-        return TenantService.get_user_role(account, tenant) is not None
+        return cast(dict, tenant.custom_config_dict)
 
 
 class RegisterService:
@@ -1178,11 +893,11 @@ class RegisterService:
             # extend end：初始化用户额度数据
 
             account.last_login_ip = ip_address
-            account.initialized_at = naive_utc_now()
+            account.initialized_at = datetime.now(UTC).replace(tzinfo=None)
 
             TenantService.create_owner_tenant_if_not_exist(account=account, is_setup=True)
 
-            dify_setup = DifySetup(version=dify_config.project.version)
+            dify_setup = DifySetup(version=dify_config.CURRENT_VERSION)
             db.session.add(dify_setup)
             db.session.commit()
         except Exception as e:
@@ -1192,7 +907,7 @@ class RegisterService:
             db.session.query(Tenant).delete()
             db.session.commit()
 
-            logger.exception("Setup account failed, email: %s, name: %s", email, name)
+            logging.exception(f"Setup account failed, email: {email}, name: {name}")
             raise ValueError(f"Setup failed: {e}")
 
     @classmethod
@@ -1219,16 +934,12 @@ class RegisterService:
                 is_setup=is_setup,
             )
             account.status = AccountStatus.ACTIVE.value if not status else status.value
-            account.initialized_at = naive_utc_now()
+            account.initialized_at = datetime.now(UTC).replace(tzinfo=None)
 
             if open_id is not None and provider is not None:
                 AccountService.link_account_integrate(provider, open_id, account)
 
-            if (
-                FeatureService.get_system_features().is_allow_create_workspace
-                and create_workspace_required
-                and FeatureService.get_system_features().license.workspaces.is_available()
-            ):
+            if FeatureService.get_system_features().is_allow_create_workspace and create_workspace_required:
                 tenant = TenantService.create_tenant(f"{account.name}'s Workspace")
                 TenantService.create_tenant_member(tenant, account, role="owner")
                 account.current_tenant = tenant
@@ -1237,15 +948,15 @@ class RegisterService:
             db.session.commit()
         except WorkSpaceNotAllowedCreateError:
             db.session.rollback()
-            logger.exception("Register failed")
+            logging.exception("Register failed")
             raise AccountRegisterError("Workspace is not allowed to create.")
         except AccountRegisterError as are:
             db.session.rollback()
-            logger.exception("Register failed")
+            logging.exception("Register failed")
             raise are
         except Exception as e:
             db.session.rollback()
-            logger.exception("Register failed")
+            logging.exception("Register failed")
             raise AccountRegisterError(f"Registration failed: {e}") from e
 
         return account
@@ -1273,7 +984,7 @@ class RegisterService:
             TenantService.switch_tenant(account, tenant.id)
         else:
             TenantService.check_member_permission(tenant, inviter, account, "add")
-            ta = db.session.query(TenantAccountJoin).filter_by(tenant_id=tenant.id, account_id=account.id).first()
+            ta = TenantAccountJoin.query.filter_by(tenant_id=tenant.id, account_id=account.id).first()
 
             if not ta:
                 TenantService.create_tenant_member(tenant, account, role)
@@ -1283,11 +994,10 @@ class RegisterService:
                 raise AccountAlreadyInTenantError("Account already in tenant.")
 
         token = cls.generate_invite_token(tenant, account)
-        language = account.interface_language or "en-US"
 
         # send email
         send_invite_member_mail_task.delay(
-            language=language,
+            language=account.interface_language,
             to=email,
             token=token,
             inviter_name=inviter.name if inviter else "Dify",
@@ -1317,7 +1027,7 @@ class RegisterService:
     def revoke_token(cls, workspace_id: str, email: str, token: str):
         if workspace_id and email:
             email_hash = sha256(email.encode()).hexdigest()
-            cache_key = f"member_invite_token:{workspace_id}, {email_hash}:{token}"
+            cache_key = "member_invite_token:{}, {}:{}".format(workspace_id, email_hash, token)
             redis_client.delete(cache_key)
         else:
             redis_client.delete(cls._get_invitation_token_key(token))
@@ -1332,7 +1042,7 @@ class RegisterService:
 
         tenant = (
             db.session.query(Tenant)
-            .where(Tenant.id == invitation_data["workspace_id"], Tenant.status == "normal")
+            .filter(Tenant.id == invitation_data["workspace_id"], Tenant.status == "normal")
             .first()
         )
 
@@ -1342,7 +1052,7 @@ class RegisterService:
         tenant_account = (
             db.session.query(Account, TenantAccountJoin.role)
             .join(TenantAccountJoin, Account.id == TenantAccountJoin.account_id)
-            .where(Account.email == invitation_data["email"], TenantAccountJoin.tenant_id == tenant.id)
+            .filter(Account.email == invitation_data["email"], TenantAccountJoin.tenant_id == tenant.id)
             .first()
         )
 
