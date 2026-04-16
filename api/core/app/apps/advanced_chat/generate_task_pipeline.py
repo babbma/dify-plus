@@ -316,7 +316,7 @@ class AdvancedChatAppGenerateTaskPipeline(GraphRuntimeStateSupport):
         app_token_id = self._application_generate_entity.extras.get("app_token_id")
         if app_token_id:
             ApiTokenMessageJoinsExtend(
-                app_token_id=app_token_id, record_id=message.workflow_run_id, app_mode=AppMode.ADVANCED_CHAT.value
+                app_token_id=app_token_id, record_id=run_id, app_mode=AppMode.ADVANCED_CHAT.value
             ).add_app_token_record_id()
             # ------------------- 二开部分End - 密钥额度限制 -------------------
 
