@@ -1172,6 +1172,22 @@ class TenantService:
         if available_ta:
             return
 
+        # -------------- Extend Begin - 自动加入管理员工作空间（优先） --------------
+        if dify_config.AUTO_JOIN_ADMIN_WORKSPACE:
+            from services.account_service_extend import TenantExtendService
+
+            # 获取系统中最早创建的工作空间作为管理员工作空间
+            admin_tenant = TenantExtendService.get_super_admin_tenant_id()
+
+            if admin_tenant:
+                # 若不存在成员关系则创建，并将其设置为当前工作空间
+                TenantExtendService.create_default_tenant_member_if_not_exist(
+                    admin_tenant.id, account.id, role="normal"
+                )
+                TenantService.switch_tenant(account, admin_tenant.id, session=session)
+                return
+        # -------------- Extend End - 自动加入管理员工作空间（优先） --------------
+
         TenantService.create_owner_tenant(account, name=name, is_setup=is_setup, session=session)
 
     @staticmethod
