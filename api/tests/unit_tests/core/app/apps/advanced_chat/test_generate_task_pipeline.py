@@ -18,6 +18,7 @@ from core.app.entities.queue_entities import (
 )
 from core.app.entities.task_entities import StreamEvent
 from core.workflow.nodes.human_input.pause_reason import HumanInputRequired
+from graphon.entities import WorkflowStartReason
 from graphon.enums import WorkflowExecutionStatus
 from models.enums import MessageStatus
 from models.execution_extra_content import HumanInputContent
@@ -538,3 +539,44 @@ def test_process_stream_response_breaks_after_workflow_partial_success() -> None
     assert [resp.event for resp in responses] == [StreamEvent.WORKFLOW_FINISHED]
     pipeline._handle_workflow_partial_success_event.assert_called_once_with(partial_event, trace_manager=None)
     pipeline._base_task_pipeline.ping_stream_response.assert_not_called()
+
+
+def test_workflow_started_records_token_against_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The quota record must use the workflow run_id, not message.workflow_run_id."""
+    pipeline = _build_pipeline()
+    pipeline._workflow_id = "workflow-1"
+    pipeline._application_generate_entity = SimpleNamespace(
+        task_id="task-1",
+        extras={"app_token_id": "token-1"},
+    )
+    pipeline._resolve_graph_runtime_state = mock.Mock(return_value=object())
+    pipeline._extract_workflow_run_id = mock.Mock(return_value="run-123")
+    pipeline._workflow_response_converter = SimpleNamespace(
+        workflow_start_to_stream_response=mock.Mock(return_value="workflow-start-response")
+    )
+
+    @contextmanager
+    def fake_session():
+        yield mock.Mock()
+
+    pipeline._database_session = fake_session  # type: ignore[method-assign]
+
+    calls: list[dict[str, str]] = []
+
+    class FakeApiTokenMessageJoinsExtend:
+        def __init__(self, *, app_token_id: str, record_id: str, app_mode: str) -> None:
+            calls.append({"app_token_id": app_token_id, "record_id": record_id, "app_mode": app_mode})
+
+        def add_app_token_record_id(self) -> None:
+            return None
+
+    monkeypatch.setattr(pipeline_module, "ApiTokenMessageJoinsExtend", FakeApiTokenMessageJoinsExtend)
+
+    event = SimpleNamespace(reason=WorkflowStartReason.INITIAL)
+    responses = list(pipeline._handle_workflow_started_event(event=event))
+
+    assert responses == ["workflow-start-response"]
+    assert pipeline._workflow_run_id == "run-123"
+    assert calls == [
+        {"app_token_id": "token-1", "record_id": "run-123", "app_mode": AppMode.ADVANCED_CHAT.value}
+    ]
