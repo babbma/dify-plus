@@ -84,6 +84,14 @@ class DocumentExtractorNode(BaseNode):
             return NodeRunResult(status=WorkflowNodeExecutionStatus.FAILED, error=error_message)
 
         value = variable.value
+        if value is None:
+            return NodeRunResult(
+                status=WorkflowNodeExecutionStatus.SUCCEEDED,
+                inputs={"variable_selector": variable_selector},
+                process_data={"documents": []},
+                outputs={"text": ""},
+            )
+
         inputs = {"variable_selector": variable_selector}
         process_data = {"documents": value if isinstance(value, list) else [value]}
 

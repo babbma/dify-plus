@@ -154,14 +154,11 @@ class AdvancedChatAppGenerator(MessageBasedAppGenerator):
         # `DraftWorkflowNodeRunApi` class which handle this properly.
         files = args["files"] if args.get("files") else []
         file_extra_config = FileUploadConfigManager.convert(workflow.features_dict, is_vision=False)
-        if file_extra_config:
-            file_objs = file_factory.build_from_mappings(
-                mappings=files,
-                tenant_id=app_model.tenant_id,
-                config=file_extra_config,
-            )
-        else:
-            file_objs = []
+        file_objs = file_factory.build_from_mappings(
+            mappings=files,
+            tenant_id=app_model.tenant_id,
+            config=file_extra_config,
+        )
 
         # convert to app config
         app_config = AdvancedChatAppConfigManager.get_app_config(app_model=app_model, workflow=workflow)
